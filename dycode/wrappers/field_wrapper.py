@@ -5,8 +5,11 @@ import abc
 from dycode.core.get_value import get_value as original_get_value
 from dycode.core.types import ContextType
 from dycode.wrappers.utils import make_inheritence_strict
+import warnings
 
 _FIELDS = "__dycode_fields__"
+_DY_TYPE_SUFFIX = "_type"
+_DY_CONSTRUCTOR_ARGS_SUFFIX = "_args"
 
 
 class DynamicField:
@@ -19,15 +22,29 @@ class DynamicField:
         prefer_modules: bool = False,
         strict: bool = True,
         context: th.Optional[ContextType] = None,
+        # if is_class is True then it means that the evaluated thing is a class
+        # type that can be instantiated
+        is_class: bool = False,
+        constructor_arguments: th.Optional[dict] = None,
+        nullable: bool = False,
     ) -> None:
+        self.nullable = nullable
         self.strict = strict
         self.prefer_modules = prefer_modules
         self.eval = eval
         self.context = context
+        self.is_class = is_class
+
+        if self.is_class:
+            self.eval = True
+
+        self.constructor_arguments = constructor_arguments or {}
         self._value = value
 
     def change_context(self, context: th.Optional[ContextType] = None):
-        self.context = context
+        # TODO: might not be the best way to go
+        if self.context is None:
+            self.context = context
 
     @property
     def value(self):
@@ -39,18 +56,43 @@ class DynamicField:
             )
         )
 
+    def get_instance(self):
+        if not self.is_class:
+            raise TypeError("Cannot get instance of non-class field")
+        return self.value(**self.constructor_arguments)
+
 
 def field(
-    value,
+    default: th.Any,
     /,
     *,
     eval: bool = False,
     prefer_modules: bool = False,
     strict: bool = True,
-    context: th.Optional[ContextType] = None,
+    nullable: bool = False,
 ) -> DynamicField:
     return DynamicField(
-        value, eval=eval, prefer_modules=prefer_modules, strict=strict, context=context
+        default,
+        eval=eval,
+        prefer_modules=prefer_modules,
+        strict=strict,
+        nullable=nullable,
+    )
+
+
+def composite(
+    default: th.Optional[str],
+    /,
+    *,
+    nullable: bool = False,
+    **constructor_kwargs,
+) -> DynamicField:
+    return DynamicField(
+        default,
+        eval=True,
+        is_class=True,
+        constructor_arguments=constructor_kwargs,
+        nullable=nullable,
     )
 
 
@@ -141,15 +183,25 @@ def _dynamize_fields(
             val.change_context(globals)
 
             # get the value in the field
-            value = val.value
             actual_name = name[len(full_indicator_prefix) :]
 
             annotation = cls_annotations.get(name, None)
-            # if annotation is set to None then get the annotation from default value
-            if annotation is None:
-                annotation = type(value)
 
-            dynamic_fields[actual_name] = (annotation, value)
+            if val.is_class:
+                if annotation is not None:
+                    raise TypeError("Should not set annotation for class objects")
+                dynamic_fields[actual_name] = (
+                    val,
+                    val.get_instance(),
+                )
+
+                dynamic_fields[f"{actual_name}{_DY_TYPE_SUFFIX}"] = (str, val._value)
+                dynamic_fields[f"{actual_name}{_DY_CONSTRUCTOR_ARGS_SUFFIX}"] = (
+                    dict,
+                    val.constructor_arguments,
+                )
+            else:
+                dynamic_fields[actual_name] = (annotation or type(val.value), val.value)
 
     # Remove all the fields starting with the indicator_prefix
     # from the class dictionary so that it can work seamlessly with other libraries
@@ -186,17 +238,93 @@ def _dynamize_fields(
                 setattr(self, name, value[1])
 
             # write stuff that has been inputted in the init function
+            names_with_dict = set()
             for name, value in del_from_kwargs:
+
                 # works with both DynamicField and the actual value
                 if isinstance(value, DynamicField):
-                    setattr(self, name, value.value)
+                    # give a warning if the value is of DynamicField type
+
+                    warnings.warn(
+                        f"Passing a DynamicField object as a value to {name} is deprecated. "
+                        f"Please use the value of the DynamicField object instead.",
+                        DeprecationWarning,
+                    )
+
+                    if value.is_class:
+                        value.change_context(globals)
+                        setattr(self, name, value.get_instance())
+                    else:
+                        setattr(self, name, value.value)
                 else:
-                    setattr(self, name, value)
+                    if name + _DY_CONSTRUCTOR_ARGS_SUFFIX in getattr(
+                        self.__class__, _FIELDS, {}
+                    ) or name.endswith(_DY_CONSTRUCTOR_ARGS_SUFFIX):
+                        # This is the name of a composite so handle composites
+                        # handle construction
+                        # TODO: implement this better
+                        _name = (
+                            name
+                            if not name.endswith(_DY_CONSTRUCTOR_ARGS_SUFFIX)
+                            else name[: -len(_DY_CONSTRUCTOR_ARGS_SUFFIX)]
+                        )
+                        names_with_dict.add(_name)
+                    else:
+                        setattr(self, name, value)
+
+            del_from_kwargs_dict = dict(del_from_kwargs)
+
+            # write the dynamic class values
+            for name in names_with_dict:
+
+                val = getattr(self.__class__, _FIELDS, {}).get(name, (None, None))[0]
+
+                class_name = (
+                    val._value
+                    if name not in del_from_kwargs_dict
+                    else del_from_kwargs_dict[name]
+                )
+                class_args = (
+                    val.constructor_arguments
+                    if name + _DY_CONSTRUCTOR_ARGS_SUFFIX not in del_from_kwargs_dict
+                    else del_from_kwargs_dict[name + _DY_CONSTRUCTOR_ARGS_SUFFIX]
+                )
+
+                if class_name is None:
+                    if val.nullable:
+                        setattr(self, name, None)
+                        continue
+                    else:
+                        raise TypeError(
+                            f"Field {name} is not nullable but None given in constructor"
+                        )
+
+                # get the default constructor args
+
+                if val and val._value == class_name:
+                    constructor_args = val.constructor_arguments
+                    # overwrite class_args with original
+                    for k, v in class_args.items():
+                        constructor_args[k] = v
+                elif val:
+                    constructor_args = class_args
+
+                val = DynamicField(
+                    class_name,
+                    is_class=True,
+                    context=globals,
+                    constructor_arguments=constructor_args,
+                )
+                val.change_context(globals)
+                setattr(self, name, val.get_instance())
 
         # First set all values for potential usage in the __init__
         set_all_values()
         # init should return None by convention
         ret = prev_init(self, *args, **kwargs)
+        # TODO: check for changes: if something has been changed in the init function
+        # then raise an error
+
         # Then re-write all the values in the __init__
         set_all_values()
 
